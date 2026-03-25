@@ -111,45 +111,8 @@ train_control <- trainControl(
   savePredictions = "final"
 )
 
-# Versao robusta para evitar ROC = NA quando algum fold vier com uma classe so
-safe_two_class_summary <- function(data, lev = NULL, model = NULL) {
-  if (is.null(lev) || length(lev) != 2 || !all(lev %in% colnames(data))) {
-    return(c(ROC = NA_real_, Sens = NA_real_, Spec = NA_real_))
-  }
-
-  sens <- tryCatch(sensitivity(data$pred, data$obs, positive = lev[2]), error = function(e) NA_real_)
-  spec <- tryCatch(specificity(data$pred, data$obs, negative = lev[1]), error = function(e) NA_real_)
-
-  if (length(unique(data$obs)) < 2) {
-    return(c(ROC = 0.5, Sens = sens, Spec = spec))
-  }
-
-  roc_val <- tryCatch({
-    roc_obj <- pROC::roc(
-      response = data$obs,
-      predictor = data[[lev[2]]],
-      levels = lev,
-      direction = "<",
-      quiet = TRUE
-    )
-    as.numeric(pROC::auc(roc_obj))
-  }, error = function(e) NA_real_)
-
-  if (is.na(roc_val)) roc_val <- 0.5
-  c(ROC = roc_val, Sens = sens, Spec = spec)
-}
-
-# Controle especifico para o XGBoost no caret (mais estavel que repeatedcv 10x3 para base pequena)
-xgb_train_control <- trainControl(
-  method = "cv",
-  number = 5,
-  classProbs = TRUE,
-  summaryFunction = safe_two_class_summary,
-  savePredictions = "final"
-)
-
 ############################################################
-# 8. SELECAO DE VARIAVEIS (FORWARD/BACKWARD/STEPWISE/RFE/GA)
+# 8. SELECAO DE VARIAVEIS (BACKWARD)
 ############################################################
 
 get_step_vars <- function(direction, train_df, target_name) {
@@ -180,83 +143,13 @@ safe_vars <- function(x, fallback) {
 
 all_vars <- predictor_names
 
-vars_forward <- tryCatch(
-  get_step_vars("forward", train, target),
-  error = function(e) all_vars
-)
-
 vars_backward <- tryCatch(
   get_step_vars("backward", train, target),
   error = function(e) all_vars
 )
 
-vars_stepwise <- tryCatch(
-  get_step_vars("both", train, target),
-  error = function(e) all_vars
-)
-
-set.seed(123)
-rfe_sizes <- unique(sort(pmin(c(3, 5, 7, 10, 15, 20), length(all_vars))))
-rfe_sizes <- rfe_sizes[rfe_sizes >= 2]
-
-vars_rfe <- tryCatch({
-  rfe_ctrl <- rfeControl(functions = caretFuncs, method = "repeatedcv", number = 5, repeats = 2)
-  rfe_fit <- rfe(
-    x = train[, all_vars, drop = FALSE],
-    y = train[[target]],
-    sizes = rfe_sizes,
-    rfeControl = rfe_ctrl,
-    method = "rf",
-    metric = "ROC",
-    trControl = trainControl(
-      method = "cv",
-      number = 5,
-      classProbs = TRUE,
-      summaryFunction = twoClassSummary
-    )
-  )
-  predictors(rfe_fit)
-}, error = function(e) all_vars)
-
-vars_ga <- tryCatch({
-  ga_ctrl <- gafsControl(
-    functions = rfGA,
-    method = "cv",
-    number = 5,
-    verbose = FALSE
-  )
-
-  ga_fit <- gafs(
-    x = train[, all_vars, drop = FALSE],
-    y = train[[target]],
-    iters = 20,
-    popSize = 30,
-    gafsControl = ga_ctrl,
-    metric = c(internal = "ROC", external = "ROC"),
-    trControl = trainControl(
-      method = "cv",
-      number = 5,
-      classProbs = TRUE,
-      summaryFunction = twoClassSummary
-    ),
-    method = "rf"
-  )
-
-  ga_vars <- NULL
-  if (!is.null(ga_fit$optVariables)) ga_vars <- ga_fit$optVariables
-  if (is.null(ga_vars) && !is.null(ga_fit$ga$final)) ga_vars <- ga_fit$ga$final
-  if (is.numeric(ga_vars)) ga_vars <- all_vars[ga_vars]
-
-  unique(ga_vars)
-}, error = function(e) all_vars)
-
 feature_sets <- list(
-  full = all_vars,
-  forward = safe_vars(vars_forward, all_vars),
-  backward = safe_vars(vars_backward, all_vars),
-  stepwise = safe_vars(vars_stepwise, all_vars),
-  rfe = safe_vars(vars_rfe, all_vars),
-  genetic = safe_vars(vars_ga, all_vars)
+  backward = safe_vars(vars_backward, all_vars)
 )
 
 feature_sets <- lapply(feature_sets, function(v) {
@@ -264,7 +157,7 @@ feature_sets <- lapply(feature_sets, function(v) {
 })
 
 cat("\n=========================================\n")
-cat("SELECOES DE VARIAVEIS (PASSO 8)\n")
+cat("SELECAO DE VARIAVEIS (PASSO 8)\n")
 cat("=========================================\n")
 for (nm in names(feature_sets)) {
   cat(nm, "(", length(feature_sets[[nm]]), "): ", paste(feature_sets[[nm]], collapse = ", "), "\n", sep = "")
@@ -275,58 +168,77 @@ cat("=========================================\n")
 # 9. XGBOOST OTIMIZADO
 ############################################################
 
-# Algoritmo XGBoost usado com caret: method = "xgbTree"
-# (implementacao via caret::train para evitar o metodo problematico anterior)
-run_xgb_caret <- function(train_df, target_name, vars, tr_ctrl, seed = 123) {
+# Algoritmo XGBoost usado: gbtree (API nativa xgboost)
+run_xgb_gbtree <- function(train_df, target_name, vars, seed = 123) {
   set.seed(seed)
-
   train_sub <- train_df[, c(target_name, vars), drop = FALSE]
+  x_train <- as.matrix(train_sub[, vars, drop = FALSE])
+  y_train <- ifelse(train_sub[[target_name]] == "Yes", 1, 0)
+  dtrain <- xgb.DMatrix(data = x_train, label = y_train)
 
-  tune_grid <- expand.grid(
-    nrounds = c(100, 200, 300),
-    max_depth = c(3, 5, 7),
-    eta = c(0.03, 0.1),
-    gamma = c(0, 1),
-    colsample_bytree = c(0.8, 1.0),
-    min_child_weight = c(1, 5),
-    subsample = c(0.8, 1.0)
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eta = 0.05,
+    max_depth = 6,
+    subsample = 0.8,
+    colsample_bytree = 0.8
   )
 
-  # Reduz combinacoes para manter tempo viavel
-  tune_grid <- tune_grid %>% sample_n(size = min(30, nrow(tune_grid)))
-
-  fit <- tryCatch(
-    train(
-      as.formula(paste(target_name, "~ .")),
-      data = train_sub,
-      method = "xgbTree",
-      trControl = tr_ctrl,
-      metric = "ROC",
-      tuneGrid = tune_grid,
-      na.action = na.omit,
-      verbosity = 0
+  cv_fit <- tryCatch(
+    xgb.cv(
+      data = dtrain,
+      params = params,
+      nrounds = 300,
+      nfold = 10,
+      early_stopping_rounds = 20,
+      verbose = 0
     ),
     error = function(e) NULL
   )
 
-  if (is.null(fit)) {
-    return(list(model = NULL, auc_cv = -Inf, vars = vars))
+  if (is.null(cv_fit)) {
+    return(list(model = NULL, auc_cv = -Inf, vars = vars, xgb_method = "gbtree", nrounds = NA_integer_))
   }
 
-  best_auc <- if (all(is.na(fit$results$ROC))) 0.5 else max(fit$results$ROC, na.rm = TRUE)
-  list(model = fit, auc_cv = as.numeric(best_auc), vars = vars)
+  best_nrounds <- cv_fit$best_iteration
+  if (is.null(best_nrounds) || length(best_nrounds) == 0 || best_nrounds == 0) {
+    auc_col <- if ("test_auc_mean" %in% colnames(cv_fit$evaluation_log)) "test_auc_mean" else "test_auc"
+    best_nrounds <- which.max(cv_fit$evaluation_log[[auc_col]])
+  }
+
+  model_fit <- tryCatch(
+    xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = best_nrounds,
+      verbose = 0
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(model_fit)) {
+    return(list(model = NULL, auc_cv = -Inf, vars = vars, xgb_method = "gbtree", nrounds = best_nrounds))
+  }
+
+  auc_col <- if ("test_auc_mean" %in% colnames(cv_fit$evaluation_log)) "test_auc_mean" else "test_auc"
+  eval_df <- as.data.frame(cv_fit$evaluation_log)
+  best_nrounds <- max(1, min(best_nrounds, nrow(eval_df)))
+  auc_cv <- as.numeric(eval_df[[auc_col]][best_nrounds])
+
+  list(model = model_fit, auc_cv = auc_cv, vars = vars, xgb_method = "gbtree", nrounds = best_nrounds)
 }
 
-# testa cada estrategia de selecao e escolhe a melhor para XGBoost (caret)
+# testa cada estrategia de selecao e escolhe a melhor para XGBoost gbtree
 set.seed(123)
 xgb_candidates <- lapply(
   feature_sets,
-  function(v) run_xgb_caret(train, target, v, tr_ctrl = xgb_train_control, seed = 123)
+  function(v) run_xgb_gbtree(train, target, v, seed = 123)
 )
 
 candidate_auc <- sapply(xgb_candidates, function(m) m$auc_cv)
 if (all(!is.finite(candidate_auc) | candidate_auc == -Inf)) {
-  stop("Nao foi possivel treinar o XGBoost com caret (method = 'xgbTree').")
+  stop("Nao foi possivel treinar XGBoost (gbtree) com as configuracoes atuais.")
 }
 
 best_name <- names(which.max(candidate_auc))
@@ -335,9 +247,10 @@ best_xgb <- xgb_candidates[[best_name]]
 cat("\n=========================================\n")
 cat("MELHOR SELECAO DE VARIAVEIS PARA XGBOOST\n")
 cat("=========================================\n")
-cat("Algoritmo XGBoost usado: caret::train(method = 'xgbTree')\n")
+cat("Algoritmo XGBoost usado: xgboost nativo (", best_xgb$xgb_method, ")\n", sep = "")
 cat("Melhor estrategia de selecao:", best_name, "\n")
 cat("AUC CV:", round(best_xgb$auc_cv, 4), "\n")
+cat("Melhor nrounds:", best_xgb$nrounds, "\n")
 cat("Numero de variaveis:", length(best_xgb$vars), "\n")
 cat("Variaveis escolhidas:\n")
 cat(paste(best_xgb$vars, collapse = ", "), "\n")
@@ -412,7 +325,9 @@ res_xgb <- avaliar_modelo(
   model = best_xgb$model,
   test_df = test_best,
   target_name = target,
-  nome = paste0("XGBoost-caret (", best_name, ")")
+  nome = paste0("XGBoost-gbtree (", best_name, ")"),
+  xgb_direct = TRUE,
+  vars = best_xgb$vars
 )
 
 ############################################################
@@ -511,3 +426,29 @@ ggplot(comparacao, aes(x = Modelo, y = AUC, fill = Modelo)) +
   theme_minimal() +
   labs(title = "Comparacao de AUC entre Modelos") +
   ylim(0, 1)
+
+############################################################
+# 17. IMPORTANCIA DAS VARIAVEIS ESCOLHIDAS (XGBOOST)
+############################################################
+
+imp_xgb <- xgb.importance(
+  model = best_xgb$model,
+  feature_names = best_xgb$vars
+)
+
+if (is.null(imp_xgb) || nrow(imp_xgb) == 0) {
+  cat("\nNao foi possivel gerar importancia de variaveis do XGBoost.\n")
+} else {
+  imp_plot <- as.data.frame(imp_xgb) %>%
+    mutate(Feature = factor(Feature, levels = rev(Feature)))
+
+  ggplot(imp_plot, aes(x = Feature, y = Gain)) +
+    geom_col(fill = "#1f77b4") +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = "Importancia das Variaveis Selecionadas (XGBoost gbtree)",
+      x = "Variavel",
+      y = "Gain"
+    )
+}
