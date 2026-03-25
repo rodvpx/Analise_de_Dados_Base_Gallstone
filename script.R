@@ -469,6 +469,55 @@ ggplot(prob_df, aes(x = Prob, fill = Classe)) +
   )
 
 ############################################################
+# 15.1 IMPORTÂNCIA DAS VARIÁVEIS (MELHOR RESULTADO)
+############################################################
+if (grepl("XGBoost|Blend", best_model_name)) {
+  imp_xgb <- xgb.importance(model = xgb_model$model, feature_names = selected_vars)
+  imp_xgb <- as.data.frame(imp_xgb) %>%
+    arrange(desc(Gain)) %>%
+    slice_head(n = 15)
+
+  ggplot(imp_xgb, aes(x = reorder(Feature, Gain), y = Gain)) +
+    geom_col(fill = "#1f77b4") +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = "Importância das Variáveis - XGBoost",
+      subtitle = "Top 15 por ganho (Gain)",
+      x = "Variável",
+      y = "Gain"
+    )
+}
+
+if (grepl("^RF|Blend", best_model_name)) {
+  imp_rf <- varImp(model_rf, scale = FALSE)$importance
+  imp_rf$Feature <- rownames(imp_rf)
+
+  num_cols_imp <- setdiff(names(imp_rf)[sapply(imp_rf, is.numeric)], "Feature")
+  if (length(num_cols_imp) > 0) {
+    imp_rf$Overall <- rowMeans(imp_rf[, num_cols_imp, drop = FALSE], na.rm = TRUE)
+  } else {
+    imp_rf$Overall <- 0
+  }
+
+  imp_rf <- imp_rf %>%
+    dplyr::select(Feature, Overall) %>%
+    arrange(desc(Overall)) %>%
+    slice_head(n = 15)
+
+  ggplot(imp_rf, aes(x = reorder(Feature, Overall), y = Overall)) +
+    geom_col(fill = "#2ca02c") +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = "Importância das Variáveis - Random Forest",
+      subtitle = "Top 15 por importância média",
+      x = "Variável",
+      y = "Importância"
+    )
+}
+
+############################################################
 # 16. RESULTADO FINAL
 ############################################################
 
