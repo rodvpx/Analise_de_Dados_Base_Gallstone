@@ -1,6 +1,9 @@
 ############################################################
 # 0. INSTALAÇÃO DE PACOTES (EXECUTAR UMA VEZ)
 ############################################################
+# Função auxiliar para instalar pacotes caso não estejam instalados
+# (Está comentada pois deve ser executada apenas na primeira vez)
+
 # install_if_missing <- function(p) {
 #   if (!require(p, character.only = TRUE)) {
 #     install.packages(p)
@@ -17,6 +20,9 @@
 ############################################################
 # 1. PACOTES
 ############################################################
+# Carregamento das bibliotecas necessárias para análise,
+# modelagem, métricas e visualizações
+
 library(dplyr)
 library(readxl)
 library(caret)
@@ -31,20 +37,28 @@ library(MASS)
 ############################################################
 # 2. CARREGAMENTO DOS DADOS
 ############################################################
+# Leitura do dataset e padronização dos nomes das colunas
+
 df <- read_excel("dataset-uci.xlsx")
 names(df) <- make.names(names(df))
 
+# Definição da variável alvo (target)
 target <- "Gallstone.Status"
 
 ############################################################
 # 3. PRÉ-PROCESSAMENTO
 ############################################################
+# Conversão da variável alvo para fator (classificação binária)
+# Renomeação dos níveis para "No" e "Yes"
+
 df[[target]] <- as.factor(df[[target]])
 levels(df[[target]]) <- c("No", "Yes")
 
 ############################################################
 # 4. SPLIT TREINO / TESTE
 ############################################################
+# Separação estratificada dos dados (80% treino / 20% teste)
+
 set.seed(123)
 train_index <- createDataPartition(df[[target]], p = 0.8, list = FALSE)
 
@@ -54,13 +68,15 @@ test_raw  <- df[-train_index, ]
 ############################################################
 # 5. LIMPEZA DE FEATURES
 ############################################################
+# Remoção de variáveis irrelevantes ou redundantes
+
 predictor_names <- setdiff(names(train_raw), target)
 
-# Remover variáveis quase constantes
+# 5.1 Remover variáveis quase constantes (near zero variance)
 nzv <- nearZeroVar(train_raw[, predictor_names])
 if (length(nzv) > 0) predictor_names <- predictor_names[-nzv]
 
-# Remover alta correlação
+# 5.2 Remover variáveis altamente correlacionadas (> 0.9)
 num_cols <- sapply(train_raw[, predictor_names], is.numeric)
 
 if (sum(num_cols) > 1) {
@@ -73,20 +89,25 @@ if (sum(num_cols) > 1) {
   }
 }
 
+# Aplicar seleção de variáveis ao treino e teste
 train <- train_raw[, c(target, predictor_names)]
 test  <- test_raw[, c(target, predictor_names)]
 
 ############################################################
 # 6. NORMALIZAÇÃO + IMPUTAÇÃO (KNN)
 ############################################################
+# Padronização dos dados + imputação de valores faltantes via KNN
+
 pre_proc <- preProcess(
   train[, predictor_names],
   method = c("center", "scale", "knnImpute")
 )
 
+# Aplicação da transformação
 train_x <- predict(pre_proc, train[, predictor_names])
 test_x  <- predict(pre_proc, test[, predictor_names])
 
+# Reanexar variável alvo
 train <- cbind(train_x, Gallstone.Status = train[[target]])
 test  <- cbind(test_x, Gallstone.Status = test[[target]])
 
@@ -98,6 +119,9 @@ predictor_names <- setdiff(names(train), target)
 ############################################################
 # 7. CONTROLE DE TREINAMENTO (CV)
 ############################################################
+# Configuração de validação cruzada repetida
+# Métrica principal: AUC (ROC)
+
 train_control <- trainControl(
   method = "repeatedcv",
   number = 10,
@@ -109,18 +133,22 @@ train_control <- trainControl(
 
 ############################################################
 # 8. SELEÇÃO DE VARIÁVEIS (BACKWARD - REGRESSÃO LOGÍSTICA)
-# Algoritmo: GLM + StepAIC
 ############################################################
+# Seleção automática de variáveis usando StepAIC (backward)
+
 get_backward_vars <- function(train_df, target_name) {
 
+  # Modelo completo
   full_model <- glm(
     as.formula(paste(target_name, "~ .")),
     data = train_df,
     family = binomial()
   )
 
+  # Stepwise backward
   step_model <- stepAIC(full_model, direction = "backward", trace = FALSE)
 
+  # Variáveis finais selecionadas
   vars <- setdiff(names(coef(step_model)), "(Intercept)")
   unique(vars)
 }
@@ -130,12 +158,15 @@ selected_vars <- tryCatch(
   error = function(e) predictor_names
 )
 
+# Garantir robustez
 selected_vars <- intersect(selected_vars, predictor_names)
 if (length(selected_vars) < 2) selected_vars <- predictor_names
 
 ############################################################
-# 9. MODELO 1 — XGBOOST (BOOSTING - gbtree)
+# 9. MODELO 1 — XGBOOST (BOOSTING)
 ############################################################
+# Função para treinar XGBoost com validação cruzada interna
+
 run_xgb_gbtree <- function(train_df, target_name, vars, seed = 123) {
 
   set.seed(seed)
@@ -145,6 +176,7 @@ run_xgb_gbtree <- function(train_df, target_name, vars, seed = 123) {
 
   dtrain <- xgb.DMatrix(data = x_train, label = y_train)
 
+  # Parâmetros principais do modelo
   params <- list(
     objective = "binary:logistic",
     eval_metric = "auc",
@@ -154,6 +186,7 @@ run_xgb_gbtree <- function(train_df, target_name, vars, seed = 123) {
     colsample_bytree = 0.8
   )
 
+  # Cross-validation interna do XGBoost
   cv_fit <- tryCatch(
     xgb.cv(
       data = dtrain,
@@ -170,6 +203,7 @@ run_xgb_gbtree <- function(train_df, target_name, vars, seed = 123) {
     stop("Falha no xgb.cv para o modelo gbtree.")
   }
 
+  # Seleção automática do número ideal de árvores
   eval_df <- as.data.frame(cv_fit$evaluation_log)
   best_nrounds <- suppressWarnings(as.integer(cv_fit$best_iteration[1]))
 
@@ -180,12 +214,12 @@ run_xgb_gbtree <- function(train_df, target_name, vars, seed = 123) {
     }
   }
 
-  # fallback robusto para evitar erro de nrounds vazio
+  # Fallback de segurança
   if (is.null(best_nrounds) || length(best_nrounds) == 0 || is.na(best_nrounds) || best_nrounds < 1) {
     best_nrounds <- 100L
   }
-  best_nrounds <- as.integer(best_nrounds)
 
+  # Treinamento final
   model <- xgb.train(
     params = params,
     data = dtrain,
@@ -224,8 +258,10 @@ model_svm <- train(
 )
 
 ############################################################
-# 11.1 MELHORIAS (THRESHOLD E BLEND)
+# 11.1 MELHORIAS — OTIMIZAÇÃO DE THRESHOLD E BLEND
 ############################################################
+# Função para encontrar melhor threshold via índice de Youden
+
 optimize_threshold <- function(obs, prob) {
   roc_obj <- roc(obs, prob, quiet = TRUE)
   thr <- coords(roc_obj, x = "best", best.method = "youden", ret = "threshold")
@@ -234,6 +270,7 @@ optimize_threshold <- function(obs, prob) {
   thr
 }
 
+# Avaliação usando threshold customizado
 avaliar_prob_threshold <- function(prob, obs, threshold = 0.5) {
   pred <- factor(ifelse(prob > threshold, "Yes", "No"), levels = c("No", "Yes"))
   cm <- confusionMatrix(pred, obs)
@@ -248,6 +285,8 @@ avaliar_prob_threshold <- function(prob, obs, threshold = 0.5) {
 ############################################################
 # 12. FUNÇÕES DE AVALIAÇÃO
 ############################################################
+# Avaliação padrão de modelos (Confusion Matrix + ROC/AUC)
+
 avaliar_modelo <- function(model, test_df, target_name, nome, xgb = FALSE, vars = NULL) {
 
   if (xgb) {
@@ -268,6 +307,7 @@ avaliar_modelo <- function(model, test_df, target_name, nome, xgb = FALSE, vars 
   list(cm = cm, auc = auc(roc_obj), prob = prob)
 }
 
+# Função para cálculo do F1-Score
 f1_score <- function(cm) {
   p <- as.numeric(cm$byClass["Pos Pred Value"])
   r <- as.numeric(cm$byClass["Sensitivity"])
@@ -285,12 +325,13 @@ res_svm <- avaliar_modelo(model_svm, test_best, target, "SVM")
 res_xgb <- avaliar_modelo(xgb_model$model, test_best, target, "XGBoost", TRUE, selected_vars)
 
 ############################################################
-# 13.1 MELHORIAS (EXECUCAO)
+# 13.1 EXECUÇÃO DAS MELHORIAS (THRESHOLD + BLEND)
 ############################################################
+# Otimização de threshold com base no conjunto de treino
 
-# Threshold otimizado por Youden (calibrado no treino)
 prob_rf_train <- predict(model_rf, train[, c(target, selected_vars)], type = "prob")[, "Yes"]
 prob_xgb_train <- predict(xgb_model$model, as.matrix(train[, selected_vars]))
+
 thr_rf <- optimize_threshold(train[[target]], prob_rf_train)
 thr_xgb <- optimize_threshold(train[[target]], prob_xgb_train)
 
@@ -298,15 +339,17 @@ thr_xgb <- optimize_threshold(train[[target]], prob_xgb_train)
 prob_rf_test <- res_rf$prob
 prob_xgb_test <- res_xgb$prob
 
-# Blend RF + XGB
+# Ensemble simples (média das probabilidades)
 prob_blend_train <- (prob_rf_train + prob_xgb_train) / 2
 prob_blend_test <- (prob_rf_test + prob_xgb_test) / 2
 thr_blend <- optimize_threshold(train[[target]], prob_blend_train)
 
+# Avaliação dos modelos com threshold otimizado
 res_rf_thr <- avaliar_prob_threshold(prob_rf_test, test_best[[target]], thr_rf)
 res_xgb_thr <- avaliar_prob_threshold(prob_xgb_test, test_best[[target]], thr_xgb)
 res_blend <- avaliar_prob_threshold(prob_blend_test, test_best[[target]], thr_blend)
 
+# Tabela consolidada das melhorias aplicadas
 melhorias <- data.frame(
   Modelo = c(
     "RF (threshold otimizado)",
@@ -336,12 +379,15 @@ melhorias <- data.frame(
     f1_score(res_blend$cm)
   )
 ) %>%
+  # Arredondamento para melhor leitura
   mutate(across(where(is.numeric), \(x) round(x, 3))) %>%
   arrange(desc(Accuracy), desc(AUC), desc(F1))
 
 ############################################################
 # 14. COMPARAÇÃO FINAL DOS ALGORITMOS
 ############################################################
+# Comparação direta dos modelos base (sem threshold otimizado)
+
 comparacao <- data.frame(
   Modelo = c("Random Forest", "SVM", "XGBoost"),
 
@@ -378,6 +424,7 @@ comparacao <- data.frame(
   )
 )
 
+# Ajuste final da tabela
 comparacao <- comparacao %>%
   mutate(across(-Modelo, \(x) round(as.numeric(x), 3))) %>%
   arrange(desc(AUC), desc(Accuracy))
@@ -385,6 +432,8 @@ comparacao <- comparacao %>%
 ############################################################
 # 15. GRÁFICOS (COMPARAÇÃO + MELHOR MODELO)
 ############################################################
+
+# Preparação dos dados para gráfico de barras
 metricas_plot <- comparacao %>%
   dplyr::select(Modelo, Accuracy, AUC, F1) %>%
   pivot_longer(
@@ -393,21 +442,51 @@ metricas_plot <- comparacao %>%
     values_to = "Valor"
   )
 
-ggplot(metricas_plot, aes(x = Modelo, y = Valor, fill = Metrica)) +
+# Gráfico comparativo entre algoritmos (base)
+p_base <- ggplot(metricas_plot, aes(x = Modelo, y = Valor, fill = Metrica)) +
   geom_col(position = position_dodge(width = 0.8), width = 0.7) +
   scale_y_continuous(limits = c(0, 1)) +
   theme_minimal() +
   labs(
-    title = "Comparação dos Algoritmos (Accuracy, AUC e F1)",
+    title = "Comparação dos Algoritmos Base (Accuracy, AUC e F1)",
     x = "Algoritmo",
     y = "Score"
   )
 
+# Preparação dos dados para gráfico de barras com threshold otimizado
+metricas_plot_threshold <- melhorias %>%
+  mutate(Modelo = gsub(" \\(threshold otimizado\\)", "", Modelo)) %>%
+  dplyr::select(Modelo, Accuracy, AUC, F1) %>%
+  pivot_longer(
+    cols = c(Accuracy, AUC, F1),
+    names_to = "Metrica",
+    values_to = "Valor"
+  )
+
+# Gráfico comparativo entre algoritmos (threshold otimizado)
+p_threshold <- ggplot(metricas_plot_threshold, aes(x = Modelo, y = Valor, fill = Metrica)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_y_continuous(limits = c(0, 1)) +
+  theme_minimal() +
+  labs(
+    title = "Comparação dos Algoritmos com Threshold Otimizado (Accuracy, AUC e F1)",
+    x = "Algoritmo",
+    y = "Score"
+  )
+
+print(p_base)
+print(p_threshold)
+
+
+############################################################
+# Identificação automática do melhor modelo após melhorias
+############################################################
 best_row <- melhorias[1, , drop = FALSE]
 best_model_name <- best_row$Modelo[[1]]
 best_threshold <- as.numeric(best_row$Threshold[[1]])
 obs_best <- test_best[[target]]
 
+# Seleção da probabilidade correta do melhor modelo
 if (grepl("^RF", best_model_name)) {
   best_prob <- prob_rf_test
 } else if (grepl("^XGBoost", best_model_name)) {
@@ -416,14 +495,19 @@ if (grepl("^RF", best_model_name)) {
   best_prob <- prob_blend_test
 }
 
+# Predição final usando threshold otimizado
 best_pred <- factor(
   ifelse(best_prob > best_threshold, "Yes", "No"),
   levels = c("No", "Yes")
 )
 
+# Matriz de confusão e ROC do melhor modelo
 cm_best <- confusionMatrix(best_pred, obs_best, positive = "Yes")
 roc_best <- roc(obs_best, best_prob, quiet = TRUE)
 
+############################################################
+# Curva ROC do melhor modelo
+############################################################
 roc_df <- data.frame(
   FPR = 1 - roc_best$specificities,
   TPR = roc_best$sensitivities
@@ -440,6 +524,9 @@ ggplot(roc_df, aes(x = FPR, y = TPR)) +
     y = "Sensibilidade (TPR)"
   )
 
+############################################################
+# Heatmap da matriz de confusão
+############################################################
 cm_df <- as.data.frame(cm_best$table)
 colnames(cm_df) <- c("Real", "Predito", "Freq")
 
@@ -455,6 +542,9 @@ ggplot(cm_df, aes(x = Predito, y = Real, fill = Freq)) +
     y = "Classe Real"
   )
 
+############################################################
+# Distribuição das probabilidades previstas
+############################################################
 prob_df <- data.frame(Prob = best_prob, Classe = obs_best)
 
 ggplot(prob_df, aes(x = Prob, fill = Classe)) +
@@ -519,52 +609,36 @@ ggplot(threshold_impact_long, aes(x = Threshold, y = Valor, color = Metrica)) +
   )
 
 ############################################################
-# 15.2 IMPORTÂNCIA DAS VARIÁVEIS (MELHOR RESULTADO)
+# 15.2 DISTRIBUIÇÃO DAS VARIÁVEIS SELECIONADAS
 ############################################################
-if (grepl("XGBoost|Blend", best_model_name)) {
-  imp_xgb <- xgb.importance(model = xgb_model$model, feature_names = selected_vars)
-  imp_xgb <- as.data.frame(imp_xgb) %>%
-    arrange(desc(Gain)) %>%
-    slice_head(n = 15)
+if (length(selected_vars) > 0) {
+  imp_df <- varImp(model_rf, scale = FALSE)$importance %>%
+    tibble::rownames_to_column("Variavel")
 
-  ggplot(imp_xgb, aes(x = reorder(Feature, Gain), y = Gain)) +
-    geom_col(fill = "#1f77b4") +
-    coord_flip() +
-    theme_minimal() +
-    labs(
-      title = "Importância das Variáveis - XGBoost",
-      subtitle = "Top 15 por ganho (Gain)",
-      x = "Variável",
-      y = "Gain"
-    )
-}
-
-if (grepl("^RF|Blend", best_model_name)) {
-  imp_rf <- varImp(model_rf, scale = FALSE)$importance
-  imp_rf$Feature <- rownames(imp_rf)
-
-  num_cols_imp <- setdiff(names(imp_rf)[sapply(imp_rf, is.numeric)], "Feature")
-  if (length(num_cols_imp) > 0) {
-    imp_rf$Overall <- rowMeans(imp_rf[, num_cols_imp, drop = FALSE], na.rm = TRUE)
+  imp_col <- if ("Overall" %in% names(imp_df)) {
+    "Overall"
   } else {
-    imp_rf$Overall <- 0
+    setdiff(names(imp_df), "Variavel")[1]
   }
 
-  imp_rf <- imp_rf %>%
-    dplyr::select(Feature, Overall) %>%
-    arrange(desc(Overall)) %>%
+  imp_df <- imp_df %>%
+    dplyr::select(Variavel, Importancia = all_of(imp_col)) %>%
+    filter(is.finite(Importancia)) %>%
+    arrange(desc(Importancia)) %>%
     slice_head(n = 15)
 
-  ggplot(imp_rf, aes(x = reorder(Feature, Overall), y = Overall)) +
-    geom_col(fill = "#2ca02c") +
+  ggplot(imp_df, aes(x = reorder(Variavel, Importancia), y = Importancia)) +
+    geom_col(fill = "#33A02C", width = 0.85) +
     coord_flip() +
     theme_minimal() +
     labs(
-      title = "Importância das Variáveis - Random Forest",
+      title = "Importância das Variáveis Selecionadas - Random Forest",
       subtitle = "Top 15 por importância média",
       x = "Variável",
       y = "Importância"
     )
+} else {
+  cat("Aviso: não há variáveis selecionadas para o gráfico de importância.\n")
 }
 
 ############################################################
@@ -573,10 +647,7 @@ if (grepl("^RF|Blend", best_model_name)) {
 
 cat("COMPARAÇÃO FINAL DOS ALGORITMOS\n")
 cat("=========================================\n")
-
 print(comparacao)
-
-# 16.1 MELHORIAS (THRESHOLD OTIMIZADO)
 
 cat("MELHORIAS (THRESHOLD OTIMIZADO)\n")
 cat("=========================================\n")
